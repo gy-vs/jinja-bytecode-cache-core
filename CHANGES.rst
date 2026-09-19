@@ -7,6 +7,13 @@ Unreleased
 
 -   Add parameters to ``Environment.overlay`` to match ``__init__``.
     :issue:`1645`
+-   ``FileSystemBytecodeCache`` writes cache files to a temporary file in
+    the same directory and atomically replaces the final file, so other
+    processes never observe a half-written cache file. Loading no longer
+    races with ``clear``: a cache file disappearing, a directory in its
+    place or the permission error Windows raises while deleting is a
+    cache miss, while real permission and deserialization errors still
+    propagate.
 
 
 Version 3.1.1

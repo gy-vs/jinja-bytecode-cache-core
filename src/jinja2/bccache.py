@@ -5,6 +5,7 @@ slows down your application too much.
 Situations where this is useful are often forking web applications that
 are initialized on the first request.
 """
+import builtins
 import errno
 import fnmatch
 import marshal
@@ -40,6 +41,29 @@ bc_magic = (
     + pickle.dumps((sys.version_info[0] << 24) | sys.version_info[1], 2)
 )
 
+# Errors that indicate a cache entry is currently unavailable: it was
+# removed between the lookup and the open, or a component of the path is
+# not a directory.  Such an error is treated as a cache miss rather than
+# propagated.  Windows also reports a file that is being deleted as an
+# access/permission error.
+
+
+def _is_cache_miss_error(e: OSError) -> bool:
+    """Check whether an ``OSError`` raised while reading a cache file
+    should be treated as a cache miss instead of being propagated.
+
+    Files disappearing (a concurrent ``clear``), non-directory components
+    in the path and the permission error Windows raises for a file that is
+    being deleted are benign races.  Real permission problems on POSIX
+    (where ``EACCES``/``EPERM`` are not caused by a deletion in progress)
+    are still returned so the caller can surface them.
+    """
+    if e.errno in (errno.ENOENT, errno.ENOTDIR, errno.EISDIR):
+        return True
+    if os.name == "nt" and e.errno in (errno.EACCES, errno.EPERM):
+        return True
+    return False
+
 
 class Bucket:
     """Buckets are used to store the bytecode for one template.  It's created
@@ -67,8 +91,14 @@ class Bucket:
         if magic != bc_magic:
             self.reset()
             return
-        # the source code of the file changed, we need to reload
-        checksum = pickle.load(f)
+        # the source code of the file changed, we need to reload.  A
+        # truncated checksum (for example a cache file left half-written
+        # by an older version or an external writer) is a miss.
+        try:
+            checksum = pickle.load(f)
+        except EOFError:
+            self.reset()
+            return
         if self.checksum != checksum:
             self.reset()
             return
@@ -114,9 +144,11 @@ class BytecodeCache:
 
             def load_bytecode(self, bucket):
                 filename = path.join(self.directory, bucket.key)
-                if path.exists(filename):
+                try:
                     with open(filename, 'rb') as f:
                         bucket.load_bytecode(f)
+                except FileNotFoundError:
+                    pass
 
             def dump_bytecode(self, bucket):
                 filename = path.join(self.directory, bucket.key)
@@ -262,13 +294,47 @@ class FileSystemBytecodeCache(BytecodeCache):
     def load_bytecode(self, bucket: Bucket) -> None:
         filename = self._get_cache_filename(bucket)
 
-        if os.path.exists(filename):
-            with open(filename, "rb") as f:
+        # Open the file directly instead of checking for its existence
+        # first; another process could remove it (for example through
+        # :meth:`clear`) in between.
+        try:
+            f = builtins.open(filename, "rb")
+        except OSError as e:
+            # A missing file, a directory taking its place or Windows
+            # raising a permission error while another process is deleting
+            # the file is just a cache miss.  Other errors (such as real
+            # permission problems) must propagate.
+            if not _is_cache_miss_error(e):
+                raise
+        else:
+            # Once the file is open, errors while reading or
+            # deserializing are real problems and must not be hidden.
+            with f:
                 bucket.load_bytecode(f)
 
     def dump_bytecode(self, bucket: Bucket) -> None:
-        with open(self._get_cache_filename(bucket), "wb") as f:
-            bucket.write_bytecode(f)
+        filename = self._get_cache_filename(bucket)
+
+        # Write to a temporary file in the same directory and atomically
+        # replace the final file, so a concurrent reader never observes a
+        # partially written cache file.
+        fd, tmp_filename = tempfile.mkstemp(
+            prefix=f".{os.path.basename(filename)}.",
+            suffix=".tmp",
+            dir=self.directory,
+        )
+        try:
+            with os.fdopen(fd, "wb") as f:
+                bucket.write_bytecode(f)
+            os.replace(tmp_filename, filename)
+        except BaseException:
+            # Clean up the temporary file if writing or replacing failed,
+            # including when the dump is cancelled.
+            try:
+                os.remove(tmp_filename)
+            except OSError:
+                pass
+            raise
 
     def clear(self) -> None:
         # imported lazily here because google app-engine doesn't support
