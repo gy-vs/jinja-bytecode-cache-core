@@ -114,9 +114,11 @@ class BytecodeCache:
 
             def load_bytecode(self, bucket):
                 filename = path.join(self.directory, bucket.key)
-                if path.exists(filename):
+                try:
                     with open(filename, 'rb') as f:
                         bucket.load_bytecode(f)
+                except FileNotFoundError:
+                    pass
 
             def dump_bytecode(self, bucket):
                 filename = path.join(self.directory, bucket.key)
@@ -259,16 +261,69 @@ class FileSystemBytecodeCache(BytecodeCache):
     def _get_cache_filename(self, bucket: Bucket) -> str:
         return os.path.join(self.directory, self.pattern % (bucket.key,))
 
+    def _is_missing_cache_error(self, exc: OSError, filename: str) -> bool:
+        """Whether a failed cache access should behave like a cache miss."""
+        if isinstance(exc, FileNotFoundError):
+            return True
+
+        if isinstance(exc, IsADirectoryError):
+            return True
+
+        if isinstance(exc, PermissionError) and os.name == "nt":
+            # Windows reports sharing violations while another process removes
+            # a file. A file pending deletion can instead make both opening and
+            # stat fail. Both cases are cache misses. If metadata is still
+            # available, only a directory in the cache filename's place is
+            # ignored; an ordinary access-denied error remains visible.
+            winerror = getattr(exc, "winerror", None)
+
+            if winerror == 32:
+                return True
+
+            try:
+                file_stat = os.stat(filename)
+            except (FileNotFoundError, PermissionError):
+                return True
+
+            return stat.S_ISDIR(file_stat.st_mode)
+
+        return False
+
     def load_bytecode(self, bucket: Bucket) -> None:
         filename = self._get_cache_filename(bucket)
 
-        if os.path.exists(filename):
+        try:
             with open(filename, "rb") as f:
                 bucket.load_bytecode(f)
+        except OSError as e:
+            if not self._is_missing_cache_error(e, filename):
+                raise
 
     def dump_bytecode(self, bucket: Bucket) -> None:
-        with open(self._get_cache_filename(bucket), "wb") as f:
-            bucket.write_bytecode(f)
+        filename = self._get_cache_filename(bucket)
+        temporary_name = ""
+
+        try:
+            f = tempfile.NamedTemporaryFile(
+                "wb",
+                dir=os.path.dirname(filename),
+                prefix=f"{os.path.basename(filename)}.",
+                suffix=".tmp",
+                delete=False,
+            )
+            temporary_name = f.name
+
+            with f:
+                bucket.write_bytecode(f)
+
+            os.replace(temporary_name, filename)
+            temporary_name = ""
+        finally:
+            if temporary_name:
+                try:
+                    os.remove(temporary_name)
+                except FileNotFoundError:
+                    pass
 
     def clear(self) -> None:
         # imported lazily here because google app-engine doesn't support
@@ -277,11 +332,13 @@ class FileSystemBytecodeCache(BytecodeCache):
         from os import remove
 
         files = fnmatch.filter(os.listdir(self.directory), self.pattern % ("*",))
-        for filename in files:
+        for base_name in files:
+            filename = os.path.join(self.directory, base_name)
             try:
-                remove(os.path.join(self.directory, filename))
-            except OSError:
-                pass
+                remove(filename)
+            except OSError as e:
+                if not self._is_missing_cache_error(e, filename):
+                    raise
 
 
 class MemcachedBytecodeCache(BytecodeCache):
